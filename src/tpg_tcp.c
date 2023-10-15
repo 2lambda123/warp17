@@ -288,16 +288,19 @@ int tcp_close_connection(tcp_control_block_t *tcb, uint32_t flags)
         /* Cleanup retrans queue. */
         if (tcb->tcb_retrans.tr_data_mbufs) {
             /* This will free the whole chain! */
-            rte_pktmbuf_free(tcb->tcb_retrans.tr_data_mbufs);
+            pkt_mbuf_free(tcb->tcb_retrans.tr_data_mbufs);
         }
 
         /* Cleanup recv buf. */
         while (!LIST_EMPTY(&tcb->tcb_rcv_buf)) {
             tcb_buf_hdr_t *recvbuf = tcb->tcb_rcv_buf.lh_first;
 
-            rte_pktmbuf_free(recvbuf->tbh_mbuf);
+            pkt_mbuf_free(recvbuf->tbh_mbuf);
             LIST_REMOVE(recvbuf, tbh_entry);
         }
+
+        tcb->tcb_retrans.tr_data_mbufs = NULL;
+        tcb->tcb_retrans.tr_total_size = 0;
 
         tsm_terminate_statemachine(tcb);
 
@@ -370,8 +373,11 @@ void tcp_load_sockopt(tpg_tcp_sockopt_t *dest, const tcp_sockopt_t *options)
 /*****************************************************************************
  * tcp_receive_pkt()
  *
- * Return the mbuf only if it needs to be free'ed back to the pool, if it was
- * consumed, or needed later (ip refrag), return NULL.
+ *  Return the mbuf only if it needs to be free'ed back to the pool, if it was
+ *  consumed, or needed later (ip refrag), return NULL.
+ *
+ *  `mbuf`          = the remaining mbuf to be processed by following layers
+ *  `pcb->pcb_mbuf` = the remaining unprocessed data in the original mbuf
  ****************************************************************************/
 struct rte_mbuf *tcp_receive_pkt(packet_control_block_t *pcb,
                                  struct rte_mbuf *mbuf)
@@ -489,7 +495,7 @@ struct rte_mbuf *tcp_receive_pkt(packet_control_block_t *pcb,
          */
 
         if (unlikely(ipv4_general_l4_cksum(mbuf, pcb->pcb_ipv4, 0,
-                                           pcb->pcb_l4_len) != 0xffff)) {
+                                           pcb->pcb_l4_len) != 0xFFFF)) {
             RTE_LOG(DEBUG, USER2, "[%d:%s()] ERR: Invalid TCP checksum!\n",
                     pcb->pcb_core_index, __func__);
 
@@ -520,9 +526,15 @@ struct rte_mbuf *tcp_receive_pkt(packet_control_block_t *pcb,
      * Update mbuf/pcb and send packet of to the client handler
      */
 
+    /* Since we are going to adjust mbuf and then fix it in pcb_mbuf, I'm
+     * enforcing here that they are the same even before
+     */
+    assert(pcb->pcb_mbuf == mbuf);
+
     pcb->pcb_tcp = tcp_hdr;
     pcb->pcb_l5_len = pcb->pcb_l4_len - tcp_hdr_len;
-    rte_pktmbuf_adj(mbuf, tcp_hdr_len);
+    mbuf = data_adj_chain(mbuf, tcp_hdr_len);
+    pcb->pcb_mbuf = mbuf;
 
     /*
      * First try known session lookup
@@ -640,6 +652,7 @@ static struct tcp_hdr *tcp_build_hdr(tcp_control_block_t *tcb,
     tcp_hdr->tcp_flags = flags & TCP_BUILD_FLAG_MASK;
     tcp_hdr->rx_win = rte_cpu_to_be_16(tcb->tcb_rcv.wnd);
     tcp_hdr->tcp_urp = rte_cpu_to_be_16(0); /* TODO: set correctly if urgen flag is set */
+    mbuf->l4_len = tcp_hdr_len;
 
     /*
      * TODO: Do we want TCP segmentation offload, if so do it before
@@ -652,10 +665,7 @@ static struct tcp_hdr *tcp_build_hdr(tcp_control_block_t *tcb,
     if (tcb->tcb_l4.l4cb_sockopt.so_eth.ethso_tx_offload_tcp_cksum) {
 #endif
         mbuf->ol_flags |= PKT_TX_TCP_CKSUM | PKT_TX_IPV4;
-        mbuf->l4_len = tcp_hdr_len;
-
         ip_hdr_len = ((ipv4_hdr->version_ihl & 0x0F) << 2);
-
         tcp_hdr->cksum =
             ipv4_udptcp_phdr_cksum(ipv4_hdr,
                                    rte_cpu_to_be_16(ipv4_hdr->total_length) -
@@ -703,7 +713,7 @@ static struct rte_mbuf *tcp_build_hdr_mbuf(tcp_control_block_t *tcb,
 
     *tcp_hdr_p = tcp_build_hdr(tcb, mbuf, ip_hdr, sseq, flags);
     if (unlikely(!(*tcp_hdr_p))) {
-        rte_pktmbuf_free(mbuf);
+        pkt_mbuf_free(mbuf);
         return NULL;
     }
 
@@ -729,13 +739,24 @@ static bool tcp_send_pkt(tcp_control_block_t *tcb, uint32_t sseq,
     if (unlikely(!hdr)) {
         INC_STATS(STATS_LOCAL(tpg_tcp_statistics_t, tcb->tcb_l4.l4cb_interface),
                   ts_failed_data_pkts);
-        rte_pktmbuf_free(data_mbuf);
+        pkt_mbuf_free(data_mbuf);
         return false;
     }
 
     /* Perform TX timestamp propagation if needed. */
     if (data_pkt_len)
         tstamp_data_append(hdr, data_mbuf);
+
+#if defined(TPG_SW_CHECKSUMMING)
+    if (data_mbuf &&
+            !tcb->tcb_l4.l4cb_sockopt.so_eth.ethso_tx_offload_tcp_cksum) {
+        if ((DATA_IS_TSTAMP(data_mbuf))) {
+            tstamp_write_cksum_offset(hdr,
+                                      hdr->pkt_len - sizeof(struct tcp_hdr) +
+                                      RTE_PTR_DIFF(&tcp_hdr->cksum, tcp_hdr));
+        }
+    }
+#endif /*defined(TPG_SW_CHECKSUMMING)*/
 
     /* Append the data part too. */
     hdr->next = data_mbuf;
@@ -756,7 +777,7 @@ static bool tcp_send_pkt(tcp_control_block_t *tcb, uint32_t sseq,
         tcp_hdr->cksum = ipv4_update_general_l4_cksum(tcp_hdr->cksum,
                                                       data_mbuf);
     }
-#endif
+#endif /*defined(TPG_SW_CHECKSUMMING)*/
 
     /*
      * Send the packet!!
@@ -874,13 +895,15 @@ tcp_control_block_t *tcb_clone(tcp_control_block_t *tcb)
 /*****************************************************************************
  * CLI commands
  *****************************************************************************
- * - "show tcp statistics {details}"
+ * - "show tcp statistics {details} port <id>"
  ****************************************************************************/
 struct cmd_show_tcp_statistics_result {
     cmdline_fixed_string_t show;
     cmdline_fixed_string_t tcp;
     cmdline_fixed_string_t statistics;
     cmdline_fixed_string_t details;
+    cmdline_fixed_string_t port_kw;
+    uint32_t               port;
 };
 
 static cmdline_parse_token_string_t cmd_show_tcp_statistics_T_show =
@@ -891,16 +914,23 @@ static cmdline_parse_token_string_t cmd_show_tcp_statistics_T_statistics =
     TOKEN_STRING_INITIALIZER(struct cmd_show_tcp_statistics_result, statistics, "statistics");
 static cmdline_parse_token_string_t cmd_show_tcp_statistics_T_details =
     TOKEN_STRING_INITIALIZER(struct cmd_show_tcp_statistics_result, details, "details");
+static cmdline_parse_token_string_t cmd_show_tcp_statistics_T_port_kw =
+        TOKEN_STRING_INITIALIZER(struct cmd_show_tcp_statistics_result, port_kw, "port");
+static cmdline_parse_token_num_t cmd_show_tcp_statistics_T_port =
+        TOKEN_NUM_INITIALIZER(struct cmd_show_tcp_statistics_result, port, UINT32);
 
 static void cmd_show_tcp_statistics_parsed(void *parsed_result __rte_unused,
                                            struct cmdline *cl,
                                            void *data)
 {
-    int           port;
-    int           option = (intptr_t) data;
-    printer_arg_t parg = TPG_PRINTER_ARG(cli_printer, cl);
+    uint32_t                               port;
+    uint32_t                               option = (intptr_t) data;
+    struct cmd_show_tcp_statistics_result *pr = parsed_result;
+    printer_arg_t                          parg = TPG_PRINTER_ARG(cli_printer, cl);
 
     for (port = 0; port < rte_eth_dev_count(); port++) {
+        if ((option == 'p' || option == 'c') && port != pr->port)
+            continue;
 
         /*
          * Calculate totals first
@@ -1023,6 +1053,21 @@ cmdline_parse_inst_t cmd_show_tcp_statistics = {
     },
 };
 
+
+cmdline_parse_inst_t cmd_show_tcp_statistics_port = {
+    .f = cmd_show_tcp_statistics_parsed,
+    .data = (void *) (intptr_t) 'p',
+    .help_str = "show tcp statistics port <id>",
+    .tokens = {
+        (void *)&cmd_show_tcp_statistics_T_show,
+        (void *)&cmd_show_tcp_statistics_T_tcp,
+        (void *)&cmd_show_tcp_statistics_T_statistics,
+        (void *)&cmd_show_tcp_statistics_T_port_kw,
+        (void *)&cmd_show_tcp_statistics_T_port,
+        NULL,
+    },
+};
+
 cmdline_parse_inst_t cmd_show_tcp_statistics_details = {
     .f = cmd_show_tcp_statistics_parsed,
     .data = (void *) (intptr_t) 'd',
@@ -1036,11 +1081,28 @@ cmdline_parse_inst_t cmd_show_tcp_statistics_details = {
     },
 };
 
+cmdline_parse_inst_t cmd_show_tcp_statistics_port_details = {
+    .f = cmd_show_tcp_statistics_parsed,
+    .data = (void *) (intptr_t) 'c',
+    .help_str = "show tcp statistics details port <id>",
+    .tokens = {
+        (void *)&cmd_show_tcp_statistics_T_show,
+        (void *)&cmd_show_tcp_statistics_T_tcp,
+        (void *)&cmd_show_tcp_statistics_T_statistics,
+        (void *)&cmd_show_tcp_statistics_T_details,
+        (void *)&cmd_show_tcp_statistics_T_port_kw,
+        (void *)&cmd_show_tcp_statistics_T_port,
+        NULL,
+    },
+};
+
 /*****************************************************************************
  * Main menu context
  ****************************************************************************/
 static cmdline_parse_ctx_t cli_ctx[] = {
     &cmd_show_tcp_statistics,
+    &cmd_show_tcp_statistics_port,
     &cmd_show_tcp_statistics_details,
+    &cmd_show_tcp_statistics_port_details,
     NULL,
 };

@@ -166,6 +166,8 @@ struct cmd_show_ipv4_statistics_result {
     cmdline_fixed_string_t ipv4;
     cmdline_fixed_string_t statistics;
     cmdline_fixed_string_t details;
+    cmdline_fixed_string_t port_kw;
+    uint32_t               port;
 };
 
 static cmdline_parse_token_string_t cmd_show_ipv4_statistics_T_show =
@@ -176,15 +178,22 @@ static cmdline_parse_token_string_t cmd_show_ipv4_statistics_T_statistics =
     TOKEN_STRING_INITIALIZER(struct cmd_show_ipv4_statistics_result, statistics, "statistics");
 static cmdline_parse_token_string_t cmd_show_ipv4_statistics_T_details =
     TOKEN_STRING_INITIALIZER(struct cmd_show_ipv4_statistics_result, details, "details");
+static cmdline_parse_token_string_t cmd_show_ipv4_statistics_T_port_kw =
+        TOKEN_STRING_INITIALIZER(struct cmd_show_ipv4_statistics_result, port_kw, "port");
+static cmdline_parse_token_num_t cmd_show_ipv4_statistics_T_port =
+        TOKEN_NUM_INITIALIZER(struct cmd_show_ipv4_statistics_result, port, UINT32);
 
 static void cmd_show_ipv4_statistics_parsed(void *parsed_result __rte_unused,
                                             struct cmdline *cl,
                                             void *data)
 {
-    int port;
-    int option = (intptr_t) data;
+    uint32_t                                port;
+    int                                     option = (intptr_t) data;
+    struct cmd_show_ipv4_statistics_result *pr = parsed_result;
 
     for (port = 0; port < rte_eth_dev_count(); port++) {
+        if ((option == 'p' || option == 'c') && port != pr->port)
+            continue;
 
         /*
          * Calculate totals first
@@ -297,6 +306,20 @@ cmdline_parse_inst_t cmd_show_ipv4_statistics = {
     },
 };
 
+cmdline_parse_inst_t cmd_show_ipv4_statistics_port = {
+    .f = cmd_show_ipv4_statistics_parsed,
+    .data = (void *) (intptr_t) 'p',
+    .help_str = "show ipv4 statistics port <id>",
+    .tokens = {
+        (void *)&cmd_show_ipv4_statistics_T_show,
+        (void *)&cmd_show_ipv4_statistics_T_ipv4,
+        (void *)&cmd_show_ipv4_statistics_T_statistics,
+        (void *)&cmd_show_ipv4_statistics_T_port_kw,
+        (void *)&cmd_show_ipv4_statistics_T_port,
+        NULL,
+    },
+};
+
 cmdline_parse_inst_t cmd_show_ipv4_statistics_details = {
     .f = cmd_show_ipv4_statistics_parsed,
     .data = (void *) (intptr_t) 'd',
@@ -310,12 +333,30 @@ cmdline_parse_inst_t cmd_show_ipv4_statistics_details = {
     },
 };
 
+/* ATTENTION: data is gonna be filled with 'c' which means "port and details" */
+cmdline_parse_inst_t cmd_show_ipv4_statistics_port_details = {
+    .f = cmd_show_ipv4_statistics_parsed,
+    .data = (void *) (intptr_t) 'c',
+    .help_str = "show ipv4 statistics details port <id>",
+    .tokens = {
+        (void *)&cmd_show_ipv4_statistics_T_show,
+        (void *)&cmd_show_ipv4_statistics_T_ipv4,
+        (void *)&cmd_show_ipv4_statistics_T_statistics,
+        (void *)&cmd_show_ipv4_statistics_T_details,
+        (void *)&cmd_show_ipv4_statistics_T_port_kw,
+        (void *)&cmd_show_ipv4_statistics_T_port,
+        NULL,
+    },
+};
+
 /*****************************************************************************
  * Main menu context
  ****************************************************************************/
 static cmdline_parse_ctx_t cli_ctx[] = {
     &cmd_show_ipv4_statistics,
     &cmd_show_ipv4_statistics_details,
+    &cmd_show_ipv4_statistics_port,
+    &cmd_show_ipv4_statistics_port_details,
     NULL,
 };
 
@@ -504,8 +545,16 @@ static struct ipv4_hdr *ipv4_build_hdr(l4_control_block_t *l4_cb,
         ip_opt->hdr.ipt_ptr = ip_opt_len + 1;
         ip_opt->hdr.ipt_code = IPOPT_TS;
         ip_opt->hdr.ipt_flg_oflow = IPOPT_TS_TSONLY;
+        bzero(&ip_opt->data[0], sizeof(ip_opt->data));
 
         tstamp_tx_pkt(mbuf, offset, sizeof(ip_opt->data));
+#if defined(TPG_SW_CHECKSUMMING)
+        if (!sockopt->so_eth.ethso_tx_offload_ipv4_cksum) {
+            tstamp_write_cksum_offset(mbuf, mbuf->pkt_len - ip_hdr_len +
+                                      RTE_PTR_DIFF(&ip_hdr->hdr_checksum,
+                                                   ip_hdr));
+        }
+#endif /* defined(TPG_SW_CHECKSUMMING) */
     }
 
     ip_hdr->version_ihl = (4 << 4) | (ip_hdr_len >> 2);
@@ -517,22 +566,24 @@ static struct ipv4_hdr *ipv4_build_hdr(l4_control_block_t *l4_cb,
     ip_hdr->next_proto_id = protocol;
     ip_hdr->src_addr = rte_cpu_to_be_32(l4_cb->l4cb_src_addr.ip_v4);
     ip_hdr->dst_addr = rte_cpu_to_be_32(l4_cb->l4cb_dst_addr.ip_v4);
+    ip_hdr->hdr_checksum = 0;
+
+    /*
+     * Since mbuf->l3_len is used for checksum offload for ipv4 but even for
+     * layer 4 checksum, we have to set it even if we don't compute ipv4 checksum
+     */
+    mbuf->l3_len = ip_hdr_len;
 
 #if !defined(TPG_SW_CHECKSUMMING)
     if (true) {
 #else
     if (sockopt->so_eth.ethso_tx_offload_ipv4_cksum) {
-#endif
-        /*
-         * We assume hardware checksum calculation
-         */
-        mbuf->l3_len = ip_hdr_len;
+#endif /* !defined(TPG_SW_CHECKSUMMING) */
         mbuf->ol_flags |= PKT_TX_IP_CKSUM;
-        ip_hdr->hdr_checksum = 0;
     } else {
-        ip_hdr->hdr_checksum = 0;
-        /* TODO: This call does not work if options are present!! */
-        ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+        ip_hdr->hdr_checksum = rte_raw_cksum(ip_hdr, ip_hdr_len);
+        ip_hdr->hdr_checksum = (ip_hdr->hdr_checksum == 0xFFFF)
+                               ? ip_hdr->hdr_checksum : ~ip_hdr->hdr_checksum;
     }
 
     return ip_hdr;
@@ -737,11 +788,7 @@ struct rte_mbuf *ipv4_receive_pkt(packet_control_block_t *pcb,
             return mbuf;
         }
     } else {
-        /*
-         * No HW checksum support do it manually...
-         *
-         * NOTE: rte_ipv4_cksum() has a bug as it ignores options if present.
-         */
+        /* No HW checksum support do it manually */
         uint16_t checksum;
 
         checksum = rte_raw_cksum(ip_hdr, ip_hdr_len);
@@ -760,7 +807,10 @@ struct rte_mbuf *ipv4_receive_pkt(packet_control_block_t *pcb,
 
     pcb->pcb_ipv4 = ip_hdr;
     pcb->pcb_l4_len = rte_be_to_cpu_16(ip_hdr->total_length) - ip_hdr_len;
-    rte_pktmbuf_adj(mbuf, ip_hdr_len);
+
+    assert(pcb->pcb_mbuf == mbuf);
+    mbuf = data_adj_chain(mbuf, ip_hdr_len);
+    pcb->pcb_mbuf = mbuf;
 
     /* "Remove" packet padding (e.g. Ethernet). Applications might store the
      * mbuf (e.g. TCP) and it would be nice to be able to use pkt_len as the
@@ -866,13 +916,3 @@ static void ipv4_latency_check(packet_control_block_t *pcb, uint64_t tstamp)
         test_update_latency(l4cb, tstamp, pcb->pcb_tstamp);
     }
 }
-
-/*****************************************************************************
- * ipv4_recalc_tstamp_cksum()
- ****************************************************************************/
-/*static void ipv4_recalc_tstamp_cksum(struct rte_mbuf *mbuf, uint32_t offset,
- *                                     uint32_t size)
- *{
- *      TODO: support this functionality
- *}
- */

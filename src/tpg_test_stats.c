@@ -577,6 +577,71 @@ void test_state_show_stats(const tpg_test_case_t *te,
 }
 
 /*****************************************************************************
+ * test_debug_show_counters()
+ ****************************************************************************/
+void test_debug_show_counters(const tpg_test_case_t *te,
+                              printer_arg_t *printer_arg)
+{
+    test_state_counter_t  state_counter;
+    uint32_t              i = 0;
+    const char           *name = "";
+    uint32_t             *stats;
+
+    test_update_state_counter(te, &state_counter);
+
+    if (test_case_is_type(*te, L4_PROTO__TCP)) {
+        name = "tlkp_tcb_hash_table";
+        stats = (uint32_t *) &state_counter.test_states_from_tcp;
+    } else if (test_case_is_type(*te, L4_PROTO__UDP)) {
+        name = "tlkp_ucb_hash_table";
+        stats = (uint32_t *) &state_counter.test_states_from_udp;
+    } else {
+        return;
+    }
+    tpg_printf(printer_arg, "%13s %13s %13s %13s %13s\n",
+               "Init", "Closed", "Estab", "Established", "Closed");
+    tpg_printf(printer_arg, "%13"PRIu32 " %13"PRIu32 " %13"PRIu32 " %13"
+               PRIu32 " %13"PRIu32 "\n\n",
+               state_counter.tos_to_init_cbs,
+               state_counter.tos_to_open_cbs,
+               state_counter.tos_to_close_cbs,
+               state_counter.tos_to_send_cbs,
+               state_counter.tos_closed_cbs);
+
+    tpg_printf(printer_arg, "%19s %19s %20s\n",
+               "test states", name, "l4cb_test_list_entry");
+    for (i = 0; i < TSTS_MAX_STATE; ++i) {
+        tpg_printf(printer_arg, "%19s %19"PRIu32" %20"PRIu32"\n",
+            test_sm_states_array_array[i], stats[i],
+            state_counter.test_states_from_test[i]);
+    }
+
+    if (test_case_is_type(*te, L4_PROTO__TCP)) {
+        tpg_printf(printer_arg, "%19s %19s %20s\n",
+                   "tcp states", "tlkp_tcb_hash_table", "l4cb_test_list_entry");
+        for (i = 0; i < TS_MAX_STATE; ++i) {
+            tpg_printf(printer_arg, "%19s %19"PRIu32" %20"PRIu32"\n",
+                    stateNamesTCP[i],
+                    state_counter.tcp_states_from_tcp[i],
+                    state_counter.tcp_states_from_test[i]);
+        }
+    } else if (test_case_is_type(*te, L4_PROTO__UDP)) {
+        tpg_printf(printer_arg, "%19s %19s %20s\n",
+                   "udp states", "tlkp_ucb_hash_table", "l4cb_test_list_entry");
+        for (i = 0; i < US_MAX_STATE; ++i) {
+            tpg_printf(printer_arg, "%19s %19"PRIu32" %20"PRIu32"\n",
+                    stateNamesUDP[i],
+                    state_counter.udp_states_from_udp[i],
+                    state_counter.udp_states_from_test[i]);
+        }
+    } else {
+        return;
+    }
+
+    tpg_printf(printer_arg, "\n");
+}
+
+/*****************************************************************************
  * test_latency_stats_valid()
  ****************************************************************************/
 static bool test_latency_stats_valid(tpg_latency_stats_t *ts_stats)
@@ -1355,7 +1420,7 @@ static void test_stats_quit_screen(void)
     test_stats_destroy_windows();
     rte_free(stats_win);
     win_changed = false;
-    rte_set_log_level(stats_old_rte_log_level);
+    rte_log_set_global_level(stats_old_rte_log_level);
 }
 
 /*****************************************************************************
@@ -1379,8 +1444,8 @@ void test_init_stats_screen(void)
 
     sigaction(SIGWINCH, &sigact, &win_chg_old_sigact);
     win_changed = true;
-    stats_old_rte_log_level = rte_get_log_level();
-    rte_set_log_level(0);
+    stats_old_rte_log_level = rte_log_get_global_level();
+    rte_log_set_global_level(0);
     test_stats_init_detail_tc();
 
     rte_timer_init(&display_tmr);

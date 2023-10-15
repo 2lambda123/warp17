@@ -68,6 +68,17 @@
 STATS_DEFINE(tpg_udp_statistics_t);
 
 /*****************************************************************************
+ * Define statemachine state and event names
+ ****************************************************************************/
+const char *stateNamesUDP[US_MAX_STATE] = {
+
+    "US_INIT",
+    "US_LISTEN",
+    "US_OPEN",
+    "US_CLOSED"
+};
+
+/*****************************************************************************
  * Forward declarations
  ****************************************************************************/
 static cmdline_parse_ctx_t cli_ctx[];
@@ -236,7 +247,7 @@ struct rte_mbuf *udp_receive_pkt(packet_control_block_t *pcb,
          */
         if (unlikely(udp_hdr->dgram_cksum != 0) &&
             ipv4_general_l4_cksum(mbuf, pcb->pcb_ipv4, 0,
-                                  rte_be_to_cpu_16(udp_hdr->dgram_len)) != 0xffff) {
+                                  rte_be_to_cpu_16(udp_hdr->dgram_len)) != 0xFFFF) {
 
             RTE_LOG(DEBUG, USER2, "[%d:%s()] ERR: Invalid UDP checksum!\n",
                     pcb->pcb_core_index, __func__);
@@ -266,7 +277,9 @@ struct rte_mbuf *udp_receive_pkt(packet_control_block_t *pcb,
      */
     pcb->pcb_udp = udp_hdr;
     pcb->pcb_l5_len = pcb->pcb_l4_len - sizeof(struct udp_hdr);
-    rte_pktmbuf_adj(mbuf, sizeof(struct udp_hdr));
+    assert(pcb->pcb_mbuf == mbuf);
+    mbuf = data_adj_chain(mbuf, sizeof(struct udp_hdr));
+    pcb->pcb_mbuf = mbuf;
 
     /*
      * First try known session lookup
@@ -379,6 +392,8 @@ static struct udp_hdr *udp_build_hdr(udp_control_block_t *ucb,
     udp_hdr->dst_port = rte_cpu_to_be_16(ucb->ucb_l4.l4cb_dst_port);
 
     udp_hdr->dgram_len = rte_cpu_to_be_16(dgram_len + udp_hdr_len);
+    mbuf->l4_len = udp_hdr_len;
+    ip_hdr_len = ((ipv4_hdr->version_ihl & 0x0F) << 2);
 
 #if !defined(TPG_SW_CHECKSUMMING)
     if (true) {
@@ -386,9 +401,7 @@ static struct udp_hdr *udp_build_hdr(udp_control_block_t *ucb,
     if (ucb->ucb_l4.l4cb_sockopt.so_eth.ethso_tx_offload_udp_cksum) {
 #endif
         mbuf->ol_flags |= PKT_TX_UDP_CKSUM | PKT_TX_IPV4;
-        mbuf->l4_len = udp_hdr_len;
 
-        ip_hdr_len = ((ipv4_hdr->version_ihl & 0x0F) << 2);
         udp_hdr->dgram_cksum =
             ipv4_udptcp_phdr_cksum(ipv4_hdr,
                                    rte_cpu_to_be_16(ipv4_hdr->total_length) -
@@ -457,6 +470,18 @@ udp_send_pkt(udp_control_block_t *ucb, struct rte_mbuf *hdr_mbuf,
     /* Perform TX timestamp propagation if needed. */
     tstamp_data_append(hdr_mbuf, data_mbuf);
 
+#if defined(TPG_SW_CHECKSUMMING)
+    if (data_mbuf != NULL &&
+            !ucb->ucb_l4.l4cb_sockopt.so_eth.ethso_tx_offload_udp_cksum) {
+        if (unlikely(DATA_IS_TSTAMP(data_mbuf))) {
+            tstamp_write_cksum_offset(hdr_mbuf,
+                                      hdr_mbuf->pkt_len -
+                                      sizeof(struct udp_hdr) +
+                                      RTE_PTR_DIFF(&udp_hdr->dgram_cksum,
+                                                   udp_hdr));
+        }
+    }
+#endif /*defined(TPG_SW_CHECKSUMMING)*/
     /* Append the data part too. */
     hdr_mbuf->next = data_mbuf;
     hdr_mbuf->pkt_len += data_mbuf->pkt_len;
@@ -481,7 +506,7 @@ udp_send_pkt(udp_control_block_t *ucb, struct rte_mbuf *hdr_mbuf,
     }
 #else
     RTE_SET_USED(udp_hdr);
-#endif
+#endif /*defined(TPG_SW_CHECKSUMMING)*/
 
     /*
      * Send the packet!!
@@ -700,6 +725,8 @@ struct cmd_show_udp_statistics_result {
     cmdline_fixed_string_t udp;
     cmdline_fixed_string_t statistics;
     cmdline_fixed_string_t details;
+    cmdline_fixed_string_t port_kw;
+    uint32_t               port;
 };
 
 static cmdline_parse_token_string_t cmd_show_udp_statistics_T_show =
@@ -710,16 +737,23 @@ static cmdline_parse_token_string_t cmd_show_udp_statistics_T_statistics =
     TOKEN_STRING_INITIALIZER(struct cmd_show_udp_statistics_result, statistics, "statistics");
 static cmdline_parse_token_string_t cmd_show_udp_statistics_T_details =
     TOKEN_STRING_INITIALIZER(struct cmd_show_udp_statistics_result, details, "details");
+static cmdline_parse_token_string_t cmd_show_udp_statistics_T_port_kw =
+        TOKEN_STRING_INITIALIZER(struct cmd_show_udp_statistics_result, port_kw, "port");
+static cmdline_parse_token_num_t cmd_show_udp_statistics_T_port =
+        TOKEN_NUM_INITIALIZER(struct cmd_show_udp_statistics_result, port, UINT32);
 
 static void cmd_show_udp_statistics_parsed(void *parsed_result __rte_unused,
                                            struct cmdline *cl,
                                            void *data)
 {
-    int           port;
-    int           option = (intptr_t) data;
-    printer_arg_t parg = TPG_PRINTER_ARG(cli_printer, cl);
+    uint32_t                               port;
+    int                                    option = (intptr_t) data;
+    struct cmd_show_udp_statistics_result *pr = parsed_result;
+    printer_arg_t                          parg = TPG_PRINTER_ARG(cli_printer, cl);
 
     for (port = 0; port < rte_eth_dev_count(); port++) {
+        if ((option == 'p' || option == 'c') && port != pr->port)
+            continue;
 
         /*
          * Calculate totals first
@@ -828,11 +862,43 @@ cmdline_parse_inst_t cmd_show_udp_statistics_details = {
     },
 };
 
+cmdline_parse_inst_t cmd_show_udp_statistics_port = {
+    .f = cmd_show_udp_statistics_parsed,
+    .data = (void *) (intptr_t) 'p',
+    .help_str = "show udp statistics port <id>",
+    .tokens = {
+        (void *)&cmd_show_udp_statistics_T_show,
+        (void *)&cmd_show_udp_statistics_T_udp,
+        (void *)&cmd_show_udp_statistics_T_statistics,
+        (void *)&cmd_show_udp_statistics_T_port_kw,
+        (void *)&cmd_show_udp_statistics_T_port,
+        NULL,
+    },
+};
+
+/* ATTENTION: data is gonna be filled with 'c' which means "port and details" */
+cmdline_parse_inst_t cmd_show_udp_statistics_port_details = {
+    .f = cmd_show_udp_statistics_parsed,
+    .data = (void *) (intptr_t) 'c',
+    .help_str = "show udp statistics details port <id>",
+    .tokens = {
+        (void *)&cmd_show_udp_statistics_T_show,
+        (void *)&cmd_show_udp_statistics_T_udp,
+        (void *)&cmd_show_udp_statistics_T_statistics,
+        (void *)&cmd_show_udp_statistics_T_details,
+        (void *)&cmd_show_udp_statistics_T_port_kw,
+        (void *)&cmd_show_udp_statistics_T_port,
+        NULL,
+    },
+};
+
 /*****************************************************************************
  * Main menu context
  ****************************************************************************/
 static cmdline_parse_ctx_t cli_ctx[] = {
     &cmd_show_udp_statistics,
     &cmd_show_udp_statistics_details,
+    &cmd_show_udp_statistics_port,
+    &cmd_show_udp_statistics_port_details,
     NULL,
 };

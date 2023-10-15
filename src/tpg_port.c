@@ -165,6 +165,38 @@ static void port_setup_reta_table(uint8_t port, int nr_of_queus)
     rte_free(reta_data);
 }
 
+/*****************************************************************************
+ * port_init_tx_conf()
+ ****************************************************************************/
+static void port_init_tx_conf(uint16_t port)
+{
+#if !defined(TPG_SW_CHECKSUMMING)
+    struct rte_eth_txconf *tx_conf;
+
+    /* We need to enable UDP/TCP hw checksum because software checksum would
+     * take too many cpu cycles, SCTP checksum offload is not supported!
+     */
+    tx_conf = &port_dev_info[port].pi_dev_info.default_txconf;
+
+    if ((tx_conf->txq_flags & ETH_TXQ_FLAGS_NOXSUMUDP) ==
+        ETH_TXQ_FLAGS_NOXSUMUDP)
+        tx_conf->txq_flags &= ~ETH_TXQ_FLAGS_NOXSUMUDP;
+    if ((tx_conf->txq_flags & ETH_TXQ_FLAGS_NOXSUMTCP) ==
+        ETH_TXQ_FLAGS_NOXSUMTCP)
+        tx_conf->txq_flags &= ~ETH_TXQ_FLAGS_NOXSUMTCP;
+#else /* !defined(TPG_SW_CHECKSUMMING) */
+    RTE_SET_USED(port);
+#endif /* !defined(TPG_SW_CHECKSUMMING) */
+}
+
+/*****************************************************************************
+ * port_init_rx_conf()
+ ****************************************************************************/
+static void port_init_rx_conf(uint16_t port __rte_unused)
+{
+
+}
+
 
 /*****************************************************************************
  * port_get_pre_init_port_count()
@@ -420,6 +452,12 @@ static bool port_adjust_info(uint32_t port)
 {
     struct ether_addr mac_addr;
 
+    /* Adjust max_rx_pktlen. Max pktlen size may be 2 * PORT_MAX_MTU.
+     */
+    if (!port_dev_info[port].pi_dev_info.max_rx_pktlen ||
+            port_dev_info[port].pi_dev_info.max_rx_pktlen > PORT_MAX_MTU)
+        port_dev_info[port].pi_dev_info.max_rx_pktlen = PORT_MAX_MTU;
+
     /* Adjust reta_size. RETA size may be 0 in case we're running on a VF.
      * e.g: for Intel 82599 10G.
      */
@@ -459,16 +497,18 @@ static bool port_adjust_info(uint32_t port)
  ****************************************************************************/
 static bool port_setup_port(uint8_t port)
 {
-    int                 rc;
-    int                 queue;
+    int                    rc;
+    int                    queue;
 #if !defined(TPG_SW_CHECKSUMMING)
-    int                 expected_rx_flags;
-    int                 expected_tx_flags;
+    uint64_t               expected_rx_flags;
+    uint64_t               expected_tx_flags;
 #endif /* !defined(TPG_SW_CHECKSUMMING) */
-    uint16_t            number_of_rings;
-    global_config_t    *cfg;
-    struct ether_addr   mac_addr;
-    tpg_port_options_t  default_port_options;
+    uint16_t               number_of_rings;
+    global_config_t       *cfg;
+    struct ether_addr      mac_addr;
+    tpg_port_options_t     default_port_options;
+    struct rte_eth_rxconf  rx_conf;
+    struct rte_eth_txconf  tx_conf;
 
     struct rte_eth_conf default_port_config = {
         .rxmode = {
@@ -494,28 +534,18 @@ static bool port_setup_port(uint8_t port)
         }
     };
 
-    /* TODO: investigate what values we actually need? Can we make rx_conf and
-     * tx_conf device independent?
-     */
-    struct rte_eth_rxconf rx_conf = {
-        .rx_thresh = {
-            .pthresh = 8,
-            .hthresh = 8,
-            .wthresh = 4,
-        },
-        .rx_free_thresh = 64,
-        .rx_drop_en = 0
-    };
+#if defined(TPG_SW_CHECKSUMMING)
+    if ((port_dev_info[port].pi_dev_info.rx_offload_capa & DEV_RX_OFFLOAD_IPV4_CKSUM) !=
+            DEV_RX_OFFLOAD_IPV4_CKSUM)
+        default_port_config.rxmode.hw_ip_checksum = 0;
+#endif /* !defined(TPG_SW_CHECKSUMMING) */
 
-    struct rte_eth_txconf tx_conf = {
-        .tx_thresh = {
-            .pthresh = 36,
-            .hthresh = 0,
-            .wthresh = 0,
-        },
-        .tx_free_thresh = 64,
-        .tx_rs_thresh = 32,
-    };
+    /* Initialise configurations for rx and tx*/
+    port_init_rx_conf(port);
+    port_init_tx_conf(port);
+
+    rx_conf = port_dev_info[port].pi_dev_info.default_rxconf;
+    tx_conf = port_dev_info[port].pi_dev_info.default_txconf;
 
     if (!port_dev_info[port].pi_dev_info.max_rx_pktlen)
         TPG_ERROR_EXIT(EXIT_FAILURE,
@@ -528,19 +558,20 @@ static bool port_setup_port(uint8_t port)
                          DEV_RX_OFFLOAD_UDP_CKSUM |
                          DEV_RX_OFFLOAD_TCP_CKSUM);
 
-    if (!(port_dev_info[port].pi_dev_info.rx_offload_capa & expected_rx_flags))
+    if ((port_dev_info[port].pi_dev_info.rx_offload_capa &
+          expected_rx_flags) != expected_rx_flags)
         TPG_ERROR_EXIT(EXIT_FAILURE,
                        "ERROR: %s doesn't support vlan/ipv4/udp/tcp rx capabilities!\n",
                        port_dev_info[port].pi_dev_info.driver_name);
 #endif /* !defined(TPG_SW_CHECKSUMMING) */
 
 #if !defined(TPG_SW_CHECKSUMMING)
-    expected_tx_flags = (DEV_RX_OFFLOAD_VLAN_STRIP |
-                         DEV_RX_OFFLOAD_IPV4_CKSUM |
-                         DEV_RX_OFFLOAD_UDP_CKSUM |
-                         DEV_RX_OFFLOAD_TCP_CKSUM);
+    expected_tx_flags = (DEV_TX_OFFLOAD_IPV4_CKSUM |
+                         DEV_TX_OFFLOAD_UDP_CKSUM |
+                         DEV_TX_OFFLOAD_TCP_CKSUM);
 
-    if (!(port_dev_info[port].pi_dev_info.tx_offload_capa & expected_tx_flags))
+    if ((port_dev_info[port].pi_dev_info.tx_offload_capa & expected_tx_flags)
+        != expected_tx_flags)
         TPG_ERROR_EXIT(EXIT_FAILURE,
                        "ERROR: %s doesn't support vlan/ipv4/udp/tcp tx capabilities!\n",
                        port_dev_info[port].pi_dev_info.driver_name);
@@ -1193,19 +1224,25 @@ bool port_handle_cmdline(void)
  ****************************************************************************/
 struct cmd_show_port_statistics_result {
     cmdline_fixed_string_t show;
-    cmdline_fixed_string_t port;
+    cmdline_fixed_string_t portS;
     cmdline_fixed_string_t statistics;
     cmdline_fixed_string_t details;
+    cmdline_fixed_string_t port_kw;
+    uint32_t               port;
 };
 
 static cmdline_parse_token_string_t cmd_show_port_statistics_T_show =
     TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, show, "show");
-static cmdline_parse_token_string_t cmd_show_port_statistics_T_port =
-    TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, port, "port");
+static cmdline_parse_token_string_t cmd_show_port_statistics_T_portS =
+    TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, portS, "port");
 static cmdline_parse_token_string_t cmd_show_port_statistics_T_statistics =
     TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, statistics, "statistics");
 static cmdline_parse_token_string_t cmd_show_port_statistics_T_details =
     TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, details, "details");
+static cmdline_parse_token_string_t cmd_show_port_statistics_T_port_kw =
+        TOKEN_STRING_INITIALIZER(struct cmd_show_port_statistics_result, port_kw, "port");
+static cmdline_parse_token_num_t cmd_show_port_statistics_T_port =
+        TOKEN_NUM_INITIALIZER(struct cmd_show_port_statistics_result, port, UINT32);
 
 #define SHOW_ETH_STATS(counter)                        \
 do {                                                   \
@@ -1231,11 +1268,14 @@ static void cmd_show_port_statistics_parsed(void *parsed_result __rte_unused,
                                             struct cmdline *cl,
                                             void *data)
 {
-    int           port;
-    int           option = (intptr_t) data;
-    printer_arg_t parg = TPG_PRINTER_ARG(cli_printer, cl);
+    uint32_t                                port;
+    int                                     option = (intptr_t) data;
+    struct cmd_show_port_statistics_result *pr = parsed_result;
+    printer_arg_t                           parg = TPG_PRINTER_ARG(cli_printer, cl);
 
     for (port = 0; port < rte_eth_dev_count(); port++) {
+        if ((option == 'p' || option == 'c') && port != pr->port)
+            continue;
 
         /*
          * Calculate totals first
@@ -1372,7 +1412,7 @@ cmdline_parse_inst_t cmd_show_port_statistics = {
     .help_str = "show port statistics",
     .tokens = {
         (void *)&cmd_show_port_statistics_T_show,
-        (void *)&cmd_show_port_statistics_T_port,
+        (void *)&cmd_show_port_statistics_T_portS,
         (void *)&cmd_show_port_statistics_T_statistics,
         NULL,
     },
@@ -1384,9 +1424,38 @@ cmdline_parse_inst_t cmd_show_port_statistics_details = {
     .help_str = "show port statistics details",
     .tokens = {
         (void *)&cmd_show_port_statistics_T_show,
-        (void *)&cmd_show_port_statistics_T_port,
+        (void *)&cmd_show_port_statistics_T_portS,
         (void *)&cmd_show_port_statistics_T_statistics,
         (void *)&cmd_show_port_statistics_T_details,
+        NULL,
+    },
+};
+cmdline_parse_inst_t cmd_show_port_statistics_port = {
+    .f = cmd_show_port_statistics_parsed,
+    .data = (void *) (intptr_t) 'p',
+    .help_str = "show port statistics port <id>",
+    .tokens = {
+        (void *)&cmd_show_port_statistics_T_show,
+        (void *)&cmd_show_port_statistics_T_portS,
+        (void *)&cmd_show_port_statistics_T_statistics,
+        (void *)&cmd_show_port_statistics_T_port_kw,
+        (void *)&cmd_show_port_statistics_T_port,
+        NULL,
+    },
+};
+
+/* ATTENTION: data is gonna be filled with 'c' which means "port and details" */
+cmdline_parse_inst_t cmd_show_port_statistics_port_details = {
+    .f = cmd_show_port_statistics_parsed,
+    .data = (void *) (intptr_t) 'c',
+    .help_str = "show port statistics details port <id>",
+    .tokens = {
+        (void *)&cmd_show_port_statistics_T_show,
+        (void *)&cmd_show_port_statistics_T_portS,
+        (void *)&cmd_show_port_statistics_T_statistics,
+        (void *)&cmd_show_port_statistics_T_details,
+        (void *)&cmd_show_port_statistics_T_port_kw,
+        (void *)&cmd_show_port_statistics_T_port,
         NULL,
     },
 };
@@ -1638,6 +1707,8 @@ static cmdline_parse_ctx_t cli_ctx[] = {
     &cmd_show_port_link,
     &cmd_show_port_statistics,
     &cmd_show_port_statistics_details,
+    &cmd_show_port_statistics_port,
+    &cmd_show_port_statistics_port_details,
     NULL,
 };
 

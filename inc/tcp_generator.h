@@ -75,6 +75,7 @@
 #include <rte_errno.h>
 #include <rte_kni.h>
 #include <rte_cycles.h>
+#include <rte_bus_pci.h>
 
 #include <termios.h>
 #include <cmdline_parse.h>
@@ -101,12 +102,6 @@
 #ifndef static_assert
 #define static_assert _Static_assert
 #endif
-
-/*****************************************************************************
- * container_of()
- ****************************************************************************/
-#define container_of(ptr, type, member) \
-    ((type *)((char *)(ptr) - offsetof(type, member)))
 
 /*****************************************************************************
  * Remove debug message is requested
@@ -192,6 +187,8 @@ typedef TAILQ_HEAD(tcp_test_cb_list_s, l4_control_block_s) tlkp_test_cb_list_t;
 
 #include "tpg_tests_sm_states.h"
 #include "tpg_lookup.h"
+#include "tpg_tcp_sm.h"
+#include "tpg_udp.h"
 #include "tpg_tests.h"
 #include "tpg_tests_sm.h"
 
@@ -199,7 +196,6 @@ typedef TAILQ_HEAD(tcp_test_cb_list_s, l4_control_block_s) tlkp_test_cb_list_t;
 #include "tpg_arp.h"
 #include "tpg_ipv4.h"
 
-#include "tpg_tcp_sm.h"
 #include "tpg_tcp.h"
 #include "tpg_memory.h"
 #include "tpg_mbuf.h"
@@ -207,7 +203,6 @@ typedef TAILQ_HEAD(tcp_test_cb_list_s, l4_control_block_s) tlkp_test_cb_list_t;
 #include "tpg_data.h"
 #include "tpg_tcp_data.h"
 #include "tpg_tcp_lookup.h"
-#include "tpg_udp.h"
 #include "tpg_udp_lookup.h"
 
 #include "tpg_kni_if.h"

@@ -54,7 +54,7 @@
 #
 #
 
-.PHONY: all clean pyclean unittest
+.PHONY: all clean pyclean unittest travis-ut
 
 APIDIR = api
 UTDIR  = ut
@@ -93,5 +93,8 @@ pyclean:
 	$(Q)$(RM) -rf $(PYOBJS)
 
 unittest:
-	$(Q)$(MAKE) -C $(UTDIR) -f $(MKUT) -i -j1 all Q=$(Q) $(UT_ARGS)
+	$(Q)$(MAKE) -C $(UTDIR) -f $(MKUT) -j1 -i all Q=$(Q) $(UT_ARGS)
+
+travis-ut:
+	$(Q)$(MAKE) -C $(UTDIR) -f $(MKUT) -j1 all-travis Q=$(Q) $(UT_ARGS)
 

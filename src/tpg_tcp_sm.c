@@ -119,7 +119,7 @@ static tsm_function tsm_function_array[] = {
 /*****************************************************************************
  * Define statemachine state and event names
  ****************************************************************************/
-const char *stateNames[TS_MAX_STATE] = {
+const char *stateNamesTCP[TS_MAX_STATE] = {
 
     "INIT",
     "LISTEN",
@@ -278,7 +278,8 @@ static void tsm_cleanup_retrans_queu(tcp_control_block_t *tcb, uint32_t seg_ack)
     if (acked_bytes) {
         TCB_TRACE(tcb, TSM, DEBUG, "RetransQ cleanup: ADJ bytes=%"PRIu32,
                   acked_bytes);
-        rte_pktmbuf_adj(retrans->tr_data_mbufs, acked_bytes);
+        retrans->tr_data_mbufs = data_adj_chain(retrans->tr_data_mbufs,
+                                                acked_bytes);
     }
 
     if (retrans->tr_data_mbufs && retrans->tr_data_mbufs->data_len == 0) {
@@ -418,7 +419,7 @@ int tsm_str_to_state(const char *state_str)
     tcpState_t state;
 
     for (state = 0; state < TS_MAX_STATE; state++) {
-        if (strcmp(state_str, stateNames[state]) == 0)
+        if (strcmp(state_str, stateNamesTCP[state]) == 0)
             return state;
     }
     /* Should never be reached! */
@@ -2582,6 +2583,8 @@ struct cmd_show_tsm_statistics_result {
     cmdline_fixed_string_t tsm;
     cmdline_fixed_string_t statistics;
     cmdline_fixed_string_t details;
+    cmdline_fixed_string_t port_kw;
+    uint32_t               port;
 };
 
 static cmdline_parse_token_string_t cmd_show_tsm_statistics_T_show =
@@ -2592,18 +2595,25 @@ static cmdline_parse_token_string_t cmd_show_tsm_statistics_T_statistics =
     TOKEN_STRING_INITIALIZER(struct cmd_show_tsm_statistics_result, statistics, "statistics");
 static cmdline_parse_token_string_t cmd_show_tsm_statistics_T_details =
     TOKEN_STRING_INITIALIZER(struct cmd_show_tsm_statistics_result, details, "details");
+static cmdline_parse_token_string_t cmd_show_tsm_statistics_T_port_kw =
+        TOKEN_STRING_INITIALIZER(struct cmd_show_tsm_statistics_result, port_kw, "port");
+static cmdline_parse_token_num_t cmd_show_tsm_statistics_T_port =
+        TOKEN_NUM_INITIALIZER(struct cmd_show_tsm_statistics_result, port, UINT32);
 
-static void cmd_show_tsm_statistics_parsed(void *parsed_result __rte_unused,
+static void cmd_show_tsm_statistics_parsed(void *parsed_result,
                                            struct cmdline *cl,
                                            void *data)
 {
-    int           port;
-    int           core;
-    int           option = (intptr_t) data;
-    int           state;
-    printer_arg_t parg = TPG_PRINTER_ARG(cli_printer, cl);
+    uint32_t                               port;
+    uint32_t                               core;
+    struct cmd_show_tsm_statistics_result *pr = parsed_result;
+    int                                    option = (intptr_t) data;
+    int                                    state;
+    printer_arg_t                          parg = TPG_PRINTER_ARG(cli_printer, cl);
 
     for (port = 0; port < rte_eth_dev_count(); port++) {
+        if ((option == 'p' || option == 'c') && port != pr->port)
+            continue;
         /*
          * Calculate totals first
          */
@@ -2623,10 +2633,12 @@ static void cmd_show_tsm_statistics_parsed(void *parsed_result __rte_unused,
                            total_stats.tsms_tcb_states[state]);
         }
 
-        if (option == 'd') {
+        if (option == 'd' || option == 'c') {
             tpg_tsm_statistics_t *tsm_stats;
 
             STATS_FOREACH_CORE(tpg_tsm_statistics_t, port, core, tsm_stats) {
+                if (PORT_COREID_IN_MASK(port_port_cfg[port].ppc_core_mask, core))
+                    continue;
                 int idx = rte_lcore_index(core);
 
                 cmdline_printf(cl, "    - core idx %3.3u :\n", idx);
@@ -2681,6 +2693,20 @@ cmdline_parse_inst_t cmd_show_tsm_statistics = {
     },
 };
 
+cmdline_parse_inst_t cmd_show_tsm_statistics_port = {
+    .f = cmd_show_tsm_statistics_parsed,
+    .data = (void *) (intptr_t) 'p',
+    .help_str = "show tsm statistics port <id>",
+    .tokens = {
+        (void *)&cmd_show_tsm_statistics_T_show,
+        (void *)&cmd_show_tsm_statistics_T_tsm,
+        (void *)&cmd_show_tsm_statistics_T_statistics,
+        (void *)&cmd_show_tsm_statistics_T_port_kw,
+        (void *)&cmd_show_tsm_statistics_T_port,
+        NULL,
+    },
+};
+
 cmdline_parse_inst_t cmd_show_tsm_statistics_details = {
     .f = cmd_show_tsm_statistics_parsed,
     .data = (void *) (intptr_t) 'd',
@@ -2694,12 +2720,30 @@ cmdline_parse_inst_t cmd_show_tsm_statistics_details = {
     },
 };
 
+/* ATTENTION: data is gonna be filled with 'c' which means "port and details" */
+cmdline_parse_inst_t cmd_show_tsm_statistics_port_details = {
+    .f = cmd_show_tsm_statistics_parsed,
+    .data = (void *) (intptr_t) 'c',
+    .help_str = "show tsm statistics details port <id>",
+    .tokens = {
+        (void *)&cmd_show_tsm_statistics_T_show,
+        (void *)&cmd_show_tsm_statistics_T_tsm,
+        (void *)&cmd_show_tsm_statistics_T_statistics,
+        (void *)&cmd_show_tsm_statistics_T_details,
+        (void *)&cmd_show_tsm_statistics_T_port_kw,
+        (void *)&cmd_show_tsm_statistics_T_port,
+        NULL,
+    },
+};
+
 /*****************************************************************************
  * Main menu context
  ****************************************************************************/
 static cmdline_parse_ctx_t cli_ctx[] = {
     &cmd_show_tsm_statistics,
+    &cmd_show_tsm_statistics_port,
     &cmd_show_tsm_statistics_details,
+    &cmd_show_tsm_statistics_port_details,
     NULL,
 };
 
