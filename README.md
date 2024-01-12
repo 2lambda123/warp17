@@ -30,6 +30,21 @@ The WARP17 TCP/IP implementation runs completely in user-space thus avoiding
 the additional latency in the kernel stack. From a hardware perspective,
 WARP17 will be able to run on all the platforms that are supported by DPDK.
 
+Developing network components or services usually requires expensive
+proprietary solutions for validating the implemented functionalities and
+scalability or performance requirements.
+WARP17 is a platform agnostic tool based on [DPDK](http://dpdk.org/) which:
+
+* allows extremely fast generation and sustaining of stateful sessions
+* offers configurable TCP/UDP infrastructure which can be used for generating
+  high connection setup and data rates for application traffic
+* is [Linux](https://kernel.org/) based so all the openly available tools can
+  be integrated by the users of WARP17.
+
+The WARP17 TCP/IP implementation runs completely in user-space thus avoiding
+the additional latency in the kernel stack. From a hardware perspective,
+WARP17 will be able to run on all the platforms that are supported by DPDK.
+
 # Performance benchmarks
 
 You can find all the performance tests descriptions and the reference
