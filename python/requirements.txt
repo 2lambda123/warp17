@@ -1,6 +1,6 @@
 wheel==0.29.0
 enum34==1.1.2
-protobuf==2.6.1
+protobuf==3.18.3
 configparser
 netaddr==0.7.10
 bitarray==0.9.3
